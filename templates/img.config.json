@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "defaultProvider": "openai",
+  "outputDir": "./img-output",
+  "openAfterGeneration": false,
+  "count": 1,
+  "allowSilentMutation": false,
+  "limits": {
+    "maxImagesPerRun": 12,
+    "maxCostPerRunUsd": 25
+  },
+  "project": {
+    "siteRoot": "."
+  },
+  "brand": {
+    "prePrompts": [],
+    "negativePrompts": [],
+    "references": [],
+    "colors": {}
+  },
+  "assetTypes": {
+    "hero": {
+      "aliases": ["hero image", "homepage hero"],
+      "provider": "openai",
+      "aspect": "16:9",
+      "count": 1,
+      "size": "auto",
+      "style": "",
+      "outputDir": "public/generated/hero",
+      "filenamePattern": "hero-{slug}-{index}",
+      "destination": "project-assets"
+    },
+    "feature-card": {
+      "aliases": ["feature card", "feature tile", "benefit card", "benefit tile"],
+      "provider": "openai",
+      "aspect": "4:3",
+      "count": 1,
+      "size": "auto",
+      "style": "",
+      "outputDir": "public/generated/features",
+      "filenamePattern": "feature-{slug}-{index}",
+      "destination": "project-assets"
+    }
+  },
+  "destinations": {
+    "local": {
+      "type": "folder",
+      "path": "./img-output"
+    },
+    "project-assets": {
+      "type": "folder",
+      "path": "public/generated"
+    },
+    "site-proposal": {
+      "type": "site",
+      "mode": "proposal"
+    }
+  },
+  "prompt": {
+    "prePrompts": [],
+    "negativePrompts": []
+  },
+  "openai": {
+    "model": "gpt-image-2",
+    "size": "auto",
+    "quality": "auto",
+    "format": "png",
+    "compression": null
+  },
+  "gemini": {
+    "model": "gemini-3.1-flash-image-preview",
+    "aspect": "1:1",
+    "imageSize": "1K",
+    "googleSearch": false
+  }
+}

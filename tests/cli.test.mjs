@@ -1,0 +1,833 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  GEMINI_DEFAULT_MODEL,
+  MAX_IMAGES_PER_RUN,
+  OPENAI_DEFAULT_MODEL,
+  applyConfigDefaults,
+  apiErrorFromResponse,
+  activationText,
+  buildInstallPlan,
+  buildGeminiBody,
+  buildOpenAIJsonBody,
+  composePrompt,
+  discoverProjectBrandDefaults,
+  formatErrorForCli,
+  formatHealthPanel,
+  formatSetupPanel,
+  findProjectRoot,
+  keyPromptLabel,
+  loadConfig,
+  loadEnv,
+  loadPromptRecipes,
+  parseBrandColorInput,
+  parseArgs,
+  resolveAssetType,
+  run,
+  searchPromptRecipes,
+  userConfigPath,
+  userEnvPath,
+  validateArgs,
+} from "../src/img.mjs";
+
+async function withEnv(updates, callback) {
+  const previous = {};
+  for (const key of Object.keys(updates)) {
+    previous[key] = process.env[key];
+    if (updates[key] === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = updates[key];
+    }
+  }
+  try {
+    return await callback();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
+function tempConfigHome() {
+  return mkdtempSync(join(tmpdir(), "img-config-home-"));
+}
+
+test("parseArgs defaults to OpenAI GPT Image 2", () => {
+  const args = parseArgs(["--prompt", "A clean app icon"]);
+  assert.equal(args.provider, "openai");
+  assert.equal(args.model, OPENAI_DEFAULT_MODEL);
+  assert.equal(args.prompt, "A clean app icon");
+});
+
+test("parseArgs accepts a natural language request without flags", () => {
+  const args = parseArgs(["generate", "a", "photorealistic", "2:1", "image", "of", "a", "dog"]);
+  assert.equal(args.provider, "openai");
+  assert.equal(args.model, OPENAI_DEFAULT_MODEL);
+  assert.equal(args.prompt, "generate a photorealistic 2:1 image of a dog");
+});
+
+test("activate prints the image workflow loader", async () => {
+  const result = await run(["activate"]);
+  assert.equal(result.text, activationText());
+  assert.match(result.text, /img image workflow loader/);
+  assert.match(result.text, /🖼️/);
+  assert.equal(result.text.split("\n").filter(Boolean).length, 2);
+  assert.doesNotMatch(result.text, /_{3,}|\\__/);
+});
+
+test("activate remains usable as natural language when it is not the whole command", () => {
+  const args = parseArgs(["activate", "a", "neon", "product", "photo"]);
+  assert.equal(args.activate, false);
+  assert.equal(args.prompt, "activate a neon product photo");
+});
+
+test("parseArgs uses Gemini default model when selected", () => {
+  const args = parseArgs(["--provider", "gemini", "--prompt", "A clean app icon"]);
+  assert.equal(args.model, GEMINI_DEFAULT_MODEL);
+});
+
+test("OpenAI body uses image generation parameters", () => {
+  const args = parseArgs([
+    "--provider",
+    "openai",
+    "--prompt",
+    "A clean app icon",
+    "--size",
+    "1024x1024",
+    "--quality",
+    "high",
+    "--format",
+    "webp",
+  ]);
+  assert.deepEqual(buildOpenAIJsonBody(args), {
+    model: OPENAI_DEFAULT_MODEL,
+    prompt: "A clean app icon",
+    size: "1024x1024",
+    quality: "high",
+    output_format: "webp",
+  });
+});
+
+test("Gemini body includes image config and inline input data", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "img-"));
+  const inputPath = join(cwd, "reference.png");
+  writeFileSync(inputPath, Buffer.from("png"));
+  const args = parseArgs([
+    "--provider",
+    "gemini",
+    "--prompt",
+    "Restyle this",
+    "--input",
+    inputPath,
+    "--aspect",
+    "16:9",
+    "--image-size",
+    "2K",
+    "--cwd",
+    cwd,
+  ]);
+  const body = buildGeminiBody(args);
+  assert.equal(body.contents[0].parts[0].text, "Restyle this");
+  assert.equal(body.contents[0].parts[1].inline_data.mime_type, "image/png");
+  assert.equal(body.generationConfig.imageConfig.aspectRatio, "16:9");
+  assert.equal(body.generationConfig.imageConfig.imageSize, "2K");
+});
+
+test("loadEnv reads project .env without overriding process env", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "img-env-"));
+  writeFileSync(join(cwd, ".env"), "IMG_TEST_KEY=from-file\n");
+  delete process.env.IMG_TEST_KEY;
+  return withEnv({ IMG_CONFIG_HOME: tempConfigHome() }, async () => {
+    const args = parseArgs(["--prompt", "x", "--cwd", cwd]);
+    const loaded = loadEnv(args, cwd);
+    assert.equal(process.env.IMG_TEST_KEY, "from-file");
+    assert.equal(loaded.includes(join(cwd, ".env")), true);
+  });
+});
+
+test("loadEnv leaves an existing process env value in place", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "img-env-precedence-"));
+  writeFileSync(join(cwd, ".env"), "IMG_TEST_KEY=from-file\n");
+  return withEnv({
+    IMG_CONFIG_HOME: tempConfigHome(),
+    IMG_TEST_KEY: "from-process",
+  }, async () => {
+    const args = parseArgs(["--prompt", "x", "--cwd", cwd]);
+    loadEnv(args, cwd);
+    assert.equal(process.env.IMG_TEST_KEY, "from-process");
+  });
+});
+
+test("loadEnv does not walk above the detected git project root", () => {
+  const parent = mkdtempSync(join(tmpdir(), "img-env-parent-"));
+  const repo = join(parent, "repo");
+  const nested = join(repo, "app");
+  mkdirSync(join(repo, ".git"), { recursive: true });
+  mkdirSync(nested, { recursive: true });
+  writeFileSync(join(parent, ".env"), "IMG_PARENT_SECRET=do-not-load\n");
+  delete process.env.IMG_PARENT_SECRET;
+
+  return withEnv({ IMG_CONFIG_HOME: tempConfigHome() }, async () => {
+    const args = parseArgs(["--prompt", "x", "--cwd", nested]);
+    const loaded = loadEnv(args, repo);
+    assert.equal(loaded.includes(join(parent, ".env")), false);
+    assert.equal(process.env.IMG_PARENT_SECRET, undefined);
+  });
+});
+
+test("loadConfig applies provider defaults and prompt composition", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "img-config-"));
+  writeFileSync(join(cwd, "img.config.json"), JSON.stringify({
+    defaultProvider: "gemini",
+    outputDir: "./configured-output",
+    prompt: {
+      prePrompts: ["Use premium editorial lighting."],
+      negativePrompts: ["watermarks", "text overlays"],
+    },
+    gemini: {
+      model: GEMINI_DEFAULT_MODEL,
+      aspect: "16:9",
+      imageSize: "2K",
+    },
+  }, null, 2));
+
+  const result = await run(["--dry-run", "--cwd", cwd, "generate", "a", "mountain", "landscape"]);
+  assert.equal(result.provider, "gemini");
+  assert.equal(result.model, GEMINI_DEFAULT_MODEL);
+  assert.equal(result.outputDir, join(cwd, "configured-output"));
+  assert.match(result.apiPrompt, /Use premium editorial lighting/);
+  assert.match(result.apiPrompt, /User prompt:\ngenerate a mountain landscape/);
+  assert.match(result.apiPrompt, /Negative prompt - avoid:\nwatermarks\ntext overlays/);
+});
+
+test("explicit CLI provider overrides config default provider", () => {
+  const args = parseArgs(["--provider", "openai", "--prompt", "A clean app icon"]);
+  applyConfigDefaults(args, {
+    defaultProvider: "gemini",
+    openai: { model: OPENAI_DEFAULT_MODEL, quality: "high" },
+    gemini: { model: GEMINI_DEFAULT_MODEL, imageSize: "2K" },
+  });
+  assert.equal(args.provider, "openai");
+  assert.equal(args.model, OPENAI_DEFAULT_MODEL);
+  assert.equal(args.quality, "high");
+});
+
+test("composePrompt leaves plain prompts unchanged without prompt defaults", () => {
+  assert.equal(composePrompt("A clean app icon"), "A clean app icon");
+});
+
+test("loadConfig reads img.config.json from cwd", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "img-load-config-"));
+  const configPath = join(cwd, "img.config.json");
+  writeFileSync(configPath, JSON.stringify({ defaultProvider: "openai" }));
+  return withEnv({ IMG_CONFIG_HOME: tempConfigHome() }, async () => {
+    const loaded = loadConfig(parseArgs(["--cwd", cwd, "A", "prompt"]));
+    assert.equal(loaded.path, configPath);
+    assert.equal(loaded.config.defaultProvider, "openai");
+  });
+});
+
+test("loadConfig rejects missing explicit config files", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "img-missing-config-"));
+  assert.throws(
+    () => loadConfig(parseArgs(["--cwd", cwd, "--config", "missing.json", "A", "prompt"])),
+    /Explicit config file not found/,
+  );
+});
+
+test("loadConfig layers user config and nearest project config", () => {
+  const configHome = tempConfigHome();
+  const repo = mkdtempSync(join(tmpdir(), "img-layered-"));
+  const nested = join(repo, "packages", "site");
+  mkdirSync(join(repo, ".git"));
+  mkdirSync(nested, { recursive: true });
+  writeFileSync(userConfigPath({ IMG_CONFIG_HOME: configHome }), JSON.stringify({
+    defaultProvider: "openai",
+    outputDir: "./user-output",
+    prompt: {
+      prePrompts: ["Use global brand polish."],
+      negativePrompts: ["watermarks"],
+    },
+  }, null, 2));
+  writeFileSync(join(repo, "img.config.json"), JSON.stringify({
+    schemaVersion: 1,
+    defaultProvider: "gemini",
+    outputDir: "./project-output",
+    prompt: {
+      prePrompts: ["Use project campaign styling."],
+      negativePrompts: ["watermarks", "fake UI text"],
+    },
+  }, null, 2));
+
+  return withEnv({ IMG_CONFIG_HOME: configHome }, async () => {
+    const loaded = loadConfig(parseArgs(["--cwd", nested, "A", "prompt"]));
+    assert.equal(loaded.path, join(repo, "img.config.json"));
+    assert.deepEqual(loaded.layers.map((layer) => layer.type), ["user", "project"]);
+    assert.equal(loaded.config.defaultProvider, "gemini");
+    assert.equal(loaded.config.outputDir, "./project-output");
+    assert.deepEqual(loaded.config.prompt.prePrompts, [
+      "Use global brand polish.",
+      "Use project campaign styling.",
+    ]);
+    assert.deepEqual(loaded.config.prompt.negativePrompts, ["watermarks", "fake UI text"]);
+  });
+});
+
+test("resolveAssetType accepts configured ids and aliases", () => {
+  const config = {
+    assetTypes: {
+      "feature-card": {
+        aliases: ["feature tile", "benefit card"],
+        provider: "openai",
+      },
+    },
+  };
+  assert.equal(resolveAssetType(config, "feature-card").id, "feature-card");
+  assert.equal(resolveAssetType(config, "benefit card").id, "feature-card");
+  assert.throws(() => resolveAssetType(config, "unknown"), /Unknown asset type/);
+});
+
+test("asset type defaults can shape a dry-run request", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "img-asset-type-"));
+  writeFileSync(join(cwd, "img.config.json"), JSON.stringify({
+    schemaVersion: 1,
+    assetTypes: {
+      "feature-card": {
+        aliases: ["benefit card"],
+        provider: "gemini",
+        aspect: "4:3",
+        outputDir: "public/generated/features",
+        style: "Use a compact editorial feature-card composition.",
+      },
+    },
+  }, null, 2));
+
+  await withEnv({ IMG_CONFIG_HOME: tempConfigHome() }, async () => {
+    const result = await run(["--dry-run", "--cwd", cwd, "--asset-type", "benefit card", "--prompt", "A member savings image"]);
+    assert.equal(result.assetType, "feature-card");
+    assert.equal(result.provider, "gemini");
+    assert.equal(result.outputDir, join(cwd, "public/generated/features"));
+    assert.match(result.apiPrompt, /compact editorial feature-card/);
+  });
+});
+
+test("brand colors and asset count shape dry-run requests", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "img-brand-colors-"));
+  writeFileSync(join(cwd, "img.config.json"), JSON.stringify({
+    schemaVersion: 1,
+    brand: {
+      colors: {
+        primary: "#123456",
+        accent: "#ffcc00",
+      },
+    },
+    assetTypes: {
+      hero: {
+        aliases: ["homepage hero"],
+        provider: "openai",
+        aspect: "16:9",
+        count: 4,
+        style: "Use a wide editorial website hero composition.",
+      },
+    },
+  }, null, 2));
+
+  await withEnv({ IMG_CONFIG_HOME: tempConfigHome() }, async () => {
+    const result = await run(["--dry-run", "--cwd", cwd, "--asset-type", "homepage hero", "--prompt", "Retirement planning"]);
+    assert.equal(result.count, 4);
+    assert.match(result.apiPrompt, /Brand colors:\nprimary: #123456\naccent: #ffcc00/);
+    assert.match(result.apiPrompt, /wide editorial website hero/);
+  });
+});
+
+test("brand colors are included even without pre-prompts", () => {
+  const prompt = composePrompt("A member benefits hero", {
+    brandColors: {
+      primary: "#123456",
+      accent: "#ffcc00",
+    },
+  });
+  assert.match(prompt, /Brand colors:\nprimary: #123456\naccent: #ffcc00/);
+  assert.match(prompt, /User prompt:\nA member benefits hero/);
+});
+
+test("validateArgs allows dry-run without API keys", () => {
+  const args = parseArgs(["--provider", "openai", "--prompt", "A clean app icon"]);
+  assert.doesNotThrow(() => validateArgs(args, false));
+});
+
+test("buildInstallPlan detects available agent CLIs and setup recommendation", () => {
+  const plan = buildInstallPlan({
+    target: "all",
+    hasClaude: true,
+    hasCodex: true,
+    configured: false,
+    setupMode: "auto",
+  });
+  assert.equal(plan.install, true);
+  assert.equal(plan.targets.claude.available, true);
+  assert.equal(plan.targets.claude.actions.includes("claude plugin install img@nyldn-plugins --scope user"), true);
+  assert.equal(plan.targets.claude.actions.includes("claude plugin marketplace update nyldn-plugins"), true);
+  assert.equal(plan.targets.claude.actions.includes("claude plugin update img@nyldn-plugins --scope user"), true);
+  assert.equal(plan.targets.claude.actions.includes("remove generated Claude user /img command if present"), true);
+  assert.equal(plan.targets.claude.actions.some((action) => /install Claude \/img base command/.test(action)), false);
+  assert.equal(plan.targets.codex.available, true);
+  assert.equal(plan.targets.codex.actions.includes("codex plugin marketplace add https://github.com/nyldn/plugins.git"), true);
+  assert.equal(plan.targets.codex.actions.includes("codex plugin marketplace upgrade nyldn-plugins"), true);
+  assert.equal(plan.setup.action, "run");
+});
+
+test("Claude setup command uses JSON checks and does not print activation banner", () => {
+  const setupCommand = readFileSync("commands/setup.md", "utf8");
+  assert.doesNotMatch(setupCommand, /activate/);
+  assert.match(setupCommand, /setup --json/);
+  assert.match(setupCommand, /check-health --json/);
+  assert.match(setupCommand, /macos-keychain/);
+  assert.match(setupCommand, /interactive setup control panel/);
+});
+
+test("buildInstallPlan respects --no-setup", () => {
+  const plan = buildInstallPlan({
+    target: "claude",
+    hasClaude: true,
+    hasCodex: true,
+    configured: false,
+    setupMode: "never",
+  });
+  assert.equal(plan.targets.claude.available, true);
+  assert.equal(plan.targets.codex.selected, false);
+  assert.equal(plan.setup.action, "skip");
+});
+
+test("bundled prompt recipes are queryable with attribution", async () => {
+  const all = loadPromptRecipes();
+  assert.ok(all.length >= 40);
+  assert.ok(all.every((recipe) => recipe.sourceUrl && recipe.license && recipe.attribution));
+
+  const matches = searchPromptRecipes("product ad storyboard", { modelFamily: "openai", limit: 3 });
+  assert.equal(matches.length, 3);
+  assert.ok(matches.every((recipe) => recipe.modelFamily === "openai"));
+  assert.ok(matches.some((recipe) => /product|ad|storyboard|ecommerce/i.test(`${recipe.category} ${recipe.useCase} ${recipe.promptTemplate}`)));
+
+  const json = await run(["recipes", "product ad storyboard", "--model-family", "openai", "--limit", "2", "--json"]);
+  assert.equal(json.recipeSearch, true);
+  assert.equal(json.recipes.length, 2);
+  assert.match(json.recipes[0].sourceUrl, /^https:\/\/github\.com\//);
+  assert.match(json.recipes[0].notice, /adapted/i);
+
+  const text = await run(["recipes", "product ad storyboard", "--limit", "1"]);
+  assert.match(text.text, /Prompt recipes: 1 of/);
+  assert.match(text.text, /license:/);
+});
+
+test("setup --json returns non-interactive setup payload", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "img-setup-json-"));
+  const configHome = tempConfigHome();
+  await withEnv({
+    IMG_CONFIG_HOME: configHome,
+    IMG_DISABLE_KEYCHAIN: "1",
+    OPENAI_API_KEY: undefined,
+    GEMINI_API_KEY: undefined,
+  }, async () => {
+    const result = await run(["setup", "--json", "--cwd", cwd]);
+    assert.equal(result.setup, true);
+    assert.equal(result.interactive, false);
+    assert.equal(result.keys.openai, "missing");
+    assert.equal(result.nextSteps.some((step) => step.includes("img key set openai")), true);
+  });
+});
+
+test("setup can open the interactive panel in a real terminal", async () => {
+  await withEnv({ IMG_SETUP_TERMINAL_DRY_RUN: "1" }, async () => {
+    const result = await run(["setup", "--open-terminal", "--cwd", "/tmp"]);
+    assert.equal(result.setupTerminal, true);
+    assert.equal(result.opened, true);
+    assert.match(result.command, /img' setup/);
+    assert.match(result.message, /opened in macOS Terminal/);
+  });
+});
+
+test("project setup discovers brand colors and references from design docs", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "img-discovery-"));
+  mkdirSync(join(repo, ".git"));
+  writeFileSync(join(repo, "brand.md"), "Brand colors: #123456, 00aaee should not count, #abc\n");
+  writeFileSync(join(repo, "design.md"), "Accent #ffcc00\n");
+  mkdirSync(join(repo, "node_modules"), { recursive: true });
+  writeFileSync(join(repo, "node_modules", "brand.md"), "Ignore #ffffff\n");
+
+  const discovery = discoverProjectBrandDefaults(repo);
+  assert.deepEqual(discovery.colors, {
+    color1: "#123456",
+    color2: "#aabbcc",
+    color3: "#ffcc00",
+  });
+  assert.deepEqual(discovery.references.sort(), ["brand.md", "design.md"]);
+
+  await withEnv({ IMG_CONFIG_HOME: tempConfigHome() }, async () => {
+    const result = await run(["setup", "--project", "--json", "--cwd", repo]);
+    const config = JSON.parse(readFileSync(result.projectConfigFile, "utf8"));
+    assert.deepEqual(config.brand.colors, discovery.colors);
+    assert.deepEqual(config.brand.references.sort(), discovery.references.sort());
+    assert.deepEqual(result.discoveredProjectDefaults.colors, discovery.colors);
+  });
+});
+
+test("setup panel has a compact branded control-room intro", () => {
+  const panel = formatSetupPanel({
+    scope: "user",
+    projectRoot: "/Users/chris",
+    userConfigFile: "/Users/chris/.config/img/config.json",
+    projectConfigFile: null,
+    keys: {
+      openai: "missing",
+      gemini: "missing",
+    },
+    defaultProvider: "openai",
+  });
+
+  assert.match(panel, /___ __  __   _   ___ ___/);
+  assert.match(panel, /🖼️  A G E N C Y/);
+  assert.match(panel, /pixels with paperwork/);
+  assert.match(panel, /Status check: secure, but not yet useful/);
+  assert.match(panel, /1\) Credentials\s+keys, minus the copy-paste circus/);
+  assert.match(panel, /q\) Save and exit\s+leave before this becomes a dashboard/);
+});
+
+test("project setup does not ask for unused project identity metadata", () => {
+  const source = readFileSync("src/img.mjs", "utf8");
+  const template = JSON.parse(readFileSync("templates/img.config.json", "utf8"));
+  const setupDocs = readFileSync("docs/setup-file.md", "utf8");
+  const schema = JSON.parse(readFileSync("schemas/config.schema.json", "utf8"));
+
+  assert.doesNotMatch(source, /Project name|Framework|project\.name|project\.framework/);
+  assert.equal(template.project.name, undefined);
+  assert.equal(template.project.framework, undefined);
+  assert.doesNotMatch(setupDocs, /"name": ""|"framework": ""/);
+  assert.equal(schema.properties.project.properties.name, undefined);
+  assert.equal(schema.properties.project.properties.framework, undefined);
+  assert.equal(schema.properties.project.additionalProperties, true);
+});
+
+test("project setup accepts pasted brand color hex lists", () => {
+  const source = readFileSync("src/img.mjs", "utf8");
+  const template = JSON.parse(readFileSync("templates/img.config.json", "utf8"));
+
+  assert.deepEqual(parseBrandColorInput("#123456 00aaee, ffc400"), {
+    color1: "#123456",
+    color2: "#00aaee",
+    color3: "#ffc400",
+  });
+  assert.deepEqual(parseBrandColorInput("abc, #def"), {
+    color1: "#aabbcc",
+    color2: "#ddeeff",
+  });
+  assert.deepEqual(parseBrandColorInput(""), {});
+  assert.doesNotMatch(source, /Brand color name \(blank when done\)|Value for \$\{name\}/);
+  assert.match(source, /Brand colors, space or comma-separated hex codes \(# optional\)/);
+  assert.deepEqual(template.brand.colors, {});
+});
+
+test("validateArgs rejects unsupported Gemini image sizes before calling the API", () => {
+  const args = parseArgs(["--provider", "gemini", "--prompt", "A clean app icon", "--image-size", "0.5K"]);
+  assert.throws(() => validateArgs(args, false), /Use 1K, 2K, or 4K/);
+});
+
+test("validateArgs enforces configured image count limit", () => {
+  const args = parseArgs(["--prompt", "A clean app icon", "--count", "3"]);
+  applyConfigDefaults(args, {
+    limits: { maxImagesPerRun: 2 },
+  });
+  assert.throws(() => validateArgs(args, false), /exceeds the configured image limit \(2\)/);
+});
+
+test("validateArgs allows counts up to the absolute image cap", () => {
+  const args = parseArgs(["--prompt", "A clean app icon", "--count", String(MAX_IMAGES_PER_RUN)]);
+  assert.doesNotThrow(() => validateArgs(args, false));
+});
+
+test("apiErrorFromResponse preserves provider status, request id, details, and hint", async () => {
+  const args = parseArgs(["--provider", "gemini", "--prompt", "A clean app icon", "--image-size", "1K"]);
+  const response = new Response(JSON.stringify({
+    error: {
+      code: 400,
+      status: "INVALID_ARGUMENT",
+      message: "Request contains an invalid argument.",
+      details: [
+        {
+          "@type": "type.googleapis.com/google.rpc.BadRequest",
+          fieldViolations: [
+            {
+              field: "generationConfig.imageConfig.imageSize",
+              description: "Unsupported value",
+            },
+          ],
+        },
+      ],
+    },
+  }), {
+    status: 400,
+    statusText: "Bad Request",
+    headers: { "x-goog-request-id": "gemini-request-123" },
+  });
+
+  const error = await apiErrorFromResponse(response, "Gemini", args);
+  const output = formatErrorForCli(error);
+  assert.equal(output.provider, "Gemini");
+  assert.equal(output.status, 400);
+  assert.equal(output.apiStatus, "INVALID_ARGUMENT");
+  assert.equal(output.requestId, "gemini-request-123");
+  assert.match(output.hint, /ImageConfig/);
+  assert.equal(output.details[0].fieldViolations[0].field, "generationConfig.imageConfig.imageSize");
+});
+
+test("run dry-run returns provider metadata", async () => {
+  await withEnv({ IMG_CONFIG_HOME: tempConfigHome() }, async () => {
+    const result = await run(["--dry-run", "--provider", "gemini", "--prompt", "A clean app icon"]);
+    assert.equal(result.dryRun, true);
+    assert.equal(result.provider, "gemini");
+    assert.equal(result.model, GEMINI_DEFAULT_MODEL);
+  });
+});
+
+test("first generation bootstraps user setup files when the provider key is missing", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "img-first-run-"));
+  const configHome = tempConfigHome();
+  await withEnv({
+    IMG_CONFIG_HOME: configHome,
+    IMG_DISABLE_KEYCHAIN: "1",
+    OPENAI_API_KEY: undefined,
+    GEMINI_API_KEY: undefined,
+  }, async () => {
+    await assert.rejects(
+      () => run(["--cwd", cwd, "--prompt", "A clean app icon"]),
+      (error) => {
+        const output = formatErrorForCli(error);
+        const envPath = userEnvPath({ IMG_CONFIG_HOME: configHome });
+        const configPath = userConfigPath({ IMG_CONFIG_HOME: configHome });
+        assert.equal(output.setupRequired, true);
+        assert.equal(output.provider, "openai");
+        assert.equal(output.keyName, "OPENAI_API_KEY");
+        assert.equal(output.envFile, envPath);
+        assert.equal(output.envFileCreated, true);
+        assert.equal(output.userConfigFile, configPath);
+        assert.equal(output.userConfigFileCreated, true);
+        assert.equal(existsSync(envPath), true);
+        assert.equal(existsSync(configPath), true);
+        assert.match(readFileSync(envPath, "utf8"), /OPENAI_API_KEY=/);
+        assert.match(output.nextSteps.join("\n"), /img key set openai/);
+        assert.match(output.nextSteps.join("\n"), /Re-run the same \/img request/);
+        return true;
+      }
+    );
+  });
+});
+
+test("dry-run does not bootstrap user setup files when keys are missing", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "img-dry-run-no-setup-"));
+  const configHome = tempConfigHome();
+  await withEnv({
+    IMG_CONFIG_HOME: configHome,
+    IMG_DISABLE_KEYCHAIN: "1",
+    OPENAI_API_KEY: undefined,
+    GEMINI_API_KEY: undefined,
+  }, async () => {
+    const result = await run(["--dry-run", "--cwd", cwd, "--prompt", "A clean app icon"]);
+    assert.equal(result.dryRun, true);
+    assert.equal(existsSync(userEnvPath({ IMG_CONFIG_HOME: configHome })), false);
+    assert.equal(existsSync(userConfigPath({ IMG_CONFIG_HOME: configHome })), false);
+  });
+});
+
+test("key status reports effective key source without exposing values", async () => {
+  await withEnv({
+    IMG_DISABLE_KEYCHAIN: "1",
+    OPENAI_API_KEY: "sk-test-secret",
+    GEMINI_API_KEY: undefined,
+  }, async () => {
+    const result = await run(["key", "status"]);
+    assert.equal(result.key, true);
+    assert.equal(result.keys.openai.effective, "present");
+    assert.equal(result.keys.openai.source, "environment");
+    assert.equal(result.keys.gemini.effective, "missing");
+    assert.equal(JSON.stringify(result).includes("sk-test-secret"), false);
+  });
+});
+
+test("key entry prompts use API key language, not password language", () => {
+  assert.equal(keyPromptLabel("OPENAI_API_KEY"), "OpenAI API key");
+  assert.equal(keyPromptLabel("GEMINI_API_KEY"), "Gemini API key");
+  assert.equal(/password/i.test(keyPromptLabel("OPENAI_API_KEY")), false);
+});
+
+test("setup creates user files outside a git repo without requiring API keys", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "img-setup-"));
+  const configHome = tempConfigHome();
+  await withEnv({
+    IMG_CONFIG_HOME: configHome,
+    IMG_DISABLE_KEYCHAIN: "1",
+    OPENAI_API_KEY: undefined,
+    GEMINI_API_KEY: undefined,
+  }, async () => {
+    const result = await run(["setup", "--cwd", cwd]);
+    const envPath = userEnvPath({ IMG_CONFIG_HOME: configHome });
+    const configPath = userConfigPath({ IMG_CONFIG_HOME: configHome });
+    assert.equal(result.setup, true);
+    assert.equal(result.scope, "user");
+    assert.equal(result.defaultProvider, "openai");
+    assert.equal(result.envFile, envPath);
+    assert.equal(result.envFileCreated, true);
+    assert.equal(result.userConfigFile, configPath);
+    assert.equal(result.userConfigFileCreated, true);
+    assert.equal(result.projectConfigFile, null);
+    assert.equal(result.keys.openai, "missing");
+    assert.equal(existsSync(envPath), true);
+    assert.equal(existsSync(configPath), true);
+    assert.equal(existsSync(join(cwd, "img.config.json")), false);
+    assert.match(readFileSync(configPath, "utf8"), /"assetTypes"/);
+  });
+});
+
+test("setup --both inside a git repo creates user files and project config", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "img-setup-repo-"));
+  mkdirSync(join(repo, ".git"));
+  const configHome = tempConfigHome();
+  await withEnv({
+    IMG_CONFIG_HOME: configHome,
+    IMG_DISABLE_KEYCHAIN: "1",
+    OPENAI_API_KEY: undefined,
+    GEMINI_API_KEY: undefined,
+  }, async () => {
+    const result = await run(["setup", "--both", "--cwd", repo]);
+    assert.equal(result.scope, "both");
+    assert.equal(result.projectRoot, repo);
+    assert.equal(result.envFile, userEnvPath({ IMG_CONFIG_HOME: configHome }));
+    assert.equal(result.userConfigFile, userConfigPath({ IMG_CONFIG_HOME: configHome }));
+    assert.equal(result.projectConfigFile, join(repo, "img.config.json"));
+    assert.equal(existsSync(result.envFile), true);
+    assert.equal(existsSync(result.userConfigFile), true);
+    assert.equal(existsSync(result.projectConfigFile), true);
+  });
+});
+
+test("setup --project creates only project config", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "img-setup-project-"));
+  mkdirSync(join(repo, ".git"));
+  const configHome = tempConfigHome();
+  await withEnv({ IMG_CONFIG_HOME: configHome }, async () => {
+    const result = await run(["setup", "--project", "--cwd", repo]);
+    assert.equal(result.scope, "project");
+    assert.equal(result.envFile, null);
+    assert.equal(result.userConfigFile, null);
+    assert.equal(result.projectConfigFile, join(repo, "img.config.json"));
+    assert.equal(existsSync(userEnvPath({ IMG_CONFIG_HOME: configHome })), false);
+    assert.equal(existsSync(result.projectConfigFile), true);
+    assert.equal(statSync(result.projectConfigFile).mode & 0o777, 0o644);
+  });
+});
+
+test("findProjectRoot walks upward from nested project folders", () => {
+  const repo = mkdtempSync(join(tmpdir(), "img-root-"));
+  const nested = join(repo, "apps", "site");
+  mkdirSync(join(repo, ".git"));
+  mkdirSync(nested, { recursive: true });
+  assert.equal(findProjectRoot(nested), repo);
+});
+
+test("check-health reports config layers without exposing secrets", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "img-health-"));
+  mkdirSync(join(repo, ".git"));
+  const configHome = tempConfigHome();
+  writeFileSync(userConfigPath({ IMG_CONFIG_HOME: configHome }), JSON.stringify({
+    schemaVersion: 1,
+    defaultProvider: "openai",
+  }, null, 2));
+  writeFileSync(join(repo, "img.config.json"), JSON.stringify({
+    schemaVersion: 1,
+    outputDir: "./generated",
+    brand: {
+      references: ["docs/brand.md"],
+    },
+  }, null, 2));
+
+  await withEnv({
+    IMG_CONFIG_HOME: configHome,
+    OPENAI_API_KEY: "sk-test-secret",
+    GEMINI_API_KEY: undefined,
+  }, async () => {
+    const result = await run(["check-health", "--cwd", repo]);
+    assert.equal(result.checkHealth, true);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.configFiles.map((file) => file.type), ["user", "project"]);
+    assert.equal(result.keys.openai, "present");
+    assert.equal(JSON.stringify(result).includes("sk-test-secret"), false);
+    assert.equal(result.checks.some((check) => check.name === "brand-reference:docs/brand.md" && check.status === "warning"), true);
+  });
+});
+
+test("health panel formats checks instead of dumping raw JSON", () => {
+  const panel = formatHealthPanel({
+    ok: false,
+    cwd: "/Users/chris",
+    projectRoot: null,
+    configFiles: [{ type: "project", path: "/Users/chris/img.config.json" }],
+    loadedEnvFiles: ["/Users/chris/.config/img/.env.local"],
+    keys: { openai: "present", gemini: "missing" },
+    keyDetails: {
+      openai: { source: "macos-keychain" },
+      gemini: { source: "missing" },
+    },
+    checks: [
+      { name: "user-config", status: "ok", message: "User config exists.", path: "/Users/chris/.config/img/config.json" },
+      { name: "project-config", status: "warning", message: "Project config loaded outside a git project.", path: "/Users/chris/img.config.json" },
+    ],
+  });
+
+  assert.doesNotMatch(panel, /^\s*\{/);
+  assert.match(panel, /Result: needs attention/);
+  assert.match(panel, /Checks run: 2/);
+  assert.match(panel, /Credentials/);
+  assert.match(panel, /OpenAI: present via macos-keychain/);
+  assert.match(panel, /WARN\s+project-config\s+Project config loaded outside a git project\./);
+  assert.match(panel, /Next steps/);
+});
+
+test("check-health warns when cwd config is loaded without a git project root", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "img-loose-config-"));
+  const configHome = tempConfigHome();
+  writeFileSync(join(cwd, "img.config.json"), JSON.stringify({
+    schemaVersion: 1,
+    outputDir: "./generated",
+  }, null, 2));
+
+  await withEnv({ IMG_CONFIG_HOME: configHome }, async () => {
+    const health = await run(["check-health", "--cwd", cwd]);
+    assert.equal(health.projectRoot, null);
+    assert.equal(health.checks.some((check) => check.name === "project-config" && check.status === "warning"), true);
+    assert.equal(health.checks.some((check) => check.name === "recipe-index"), false);
+  });
+});
+
+test("check-health and dry-run warn when allowSilentMutation is set", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "img-silent-mutation-"));
+  mkdirSync(join(repo, ".git"));
+  writeFileSync(join(repo, "img.config.json"), JSON.stringify({
+    schemaVersion: 1,
+    allowSilentMutation: true,
+  }, null, 2));
+
+  await withEnv({ IMG_CONFIG_HOME: tempConfigHome() }, async () => {
+    const health = await run(["check-health", "--cwd", repo]);
+    assert.equal(health.checks.some((check) => check.name === "runtime-warning-project" && check.status === "warning"), true);
+
+    const dryRun = await run(["--dry-run", "--cwd", repo, "--prompt", "A clean app icon"]);
+    assert.equal(dryRun.warnings.some((warning) => warning.includes("allowSilentMutation=true")), true);
+  });
+});

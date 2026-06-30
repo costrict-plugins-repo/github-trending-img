@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nyldn/img/schemas/recipe.schema.json",
+  "title": "img prompt recipe",
+  "type": "object",
+  "required": ["schemaVersion", "id", "sourceRepo", "sourceUrl", "sourceCommit", "license", "attribution", "modelFamily", "category", "useCase", "promptTemplate"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "type": "string" },
+    "sourceRepo": { "type": "string" },
+    "sourceUrl": { "type": "string" },
+    "sourceCommit": { "type": "string" },
+    "license": { "type": "string" },
+    "attribution": { "type": "string" },
+    "notice": { "type": ["string", "null"] },
+    "modelFamily": { "type": "string" },
+    "category": { "type": "string" },
+    "useCase": { "type": "string" },
+    "promptTemplate": { "type": "string" },
+    "variables": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nyldn/img/schemas/config.schema.json",
+  "title": "img config",
+  "type": "object",
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "defaultProvider": { "enum": ["openai", "gemini"] },
+    "provider": { "enum": ["openai", "gemini"] },
+    "outputDir": { "type": "string" },
+    "openAfterGeneration": { "type": "boolean" },
+    "count": { "type": "integer", "minimum": 1, "maximum": 12 },
+    "allowSilentMutation": { "type": "boolean" },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "maxImagesPerRun": { "type": "integer", "minimum": 1, "maximum": 12 },
+        "maxCostPerRunUsd": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "project": {
+      "type": "object",
+      "properties": {
+        "siteRoot": { "type": "string" },
+        "references": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "brand": {
+      "type": "object",
+      "properties": {
+        "prePrompts": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "negativePrompts": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "references": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "colors": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "assetTypes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "aliases": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "provider": { "enum": ["openai", "gemini"] },
+          "aspect": { "type": "string" },
+          "count": { "type": "integer", "minimum": 1, "maximum": 12 },
+          "size": { "type": "string" },
+          "style": { "type": "string" },
+          "outputDir": { "type": "string" },
+          "filenamePattern": { "type": "string" },
+          "destination": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "destinations": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "type": { "enum": ["folder", "site"] },
+          "path": { "type": "string" },
+          "mode": { "type": "string" },
+          "external": { "type": "boolean" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "prompt": {
+      "type": "object",
+      "properties": {
+        "mergeMode": { "enum": ["append", "replace"] },
+        "prePrompt": { "type": "string" },
+        "prePrompts": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "negativePrompt": { "type": "string" },
+        "negativePrompts": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "openai": {
+      "type": "object",
+      "properties": {
+        "model": { "type": "string" },
+        "size": { "type": "string" },
+        "quality": { "enum": ["auto", "low", "medium", "high"] },
+        "format": { "enum": ["png", "jpeg", "webp"] },
+        "compression": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }
+      },
+      "additionalProperties": false
+    },
+    "gemini": {
+      "type": "object",
+      "properties": {
+        "model": { "type": "string" },
+        "aspect": { "type": "string" },
+        "imageSize": { "enum": ["1K", "2K", "4K"] },
+        "googleSearch": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}
